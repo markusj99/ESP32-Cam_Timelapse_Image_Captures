@@ -34,11 +34,13 @@
   failed to initialize through SD_MMC but worked reliably through SPI.
 
   No Wi-Fi is used. This keeps the project simple and reduces power use.
+  Failure diagnostics are written to TIMELAPSE.CSV whenever the SD card is available.
 */
 
 #include <Arduino.h>
 #include <esp_camera.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <FS.h>
 #include <SPI.h>
 #include <SD.h>
@@ -58,13 +60,21 @@
 //   180  = 3 minutes
 //   300  = 5 minutes
 //   600  = 10 minutes
-const uint32_t SLEEP_INTERVAL_SECONDS = 30;
+const uint32_t SLEEP_INTERVAL_SECONDS = 144;
 
 // Delay after waking before initializing the camera.
-const uint32_t CAMERA_SETTLE_MS = 2500;
+const uint32_t CAMERA_SETTLE_MS = 4000;
 
 // Delay before initializing the SD card.
 const uint32_t SD_STARTUP_DELAY_MS = 500;
+
+// Number of frames captured after camera initialization before
+// saving an image. The first frames are discarded to allow the
+// OV2640 exposure/white balance to stabilize.
+const uint8_t CAMERA_WARMUP_FRAMES = 3;
+
+// Delay between discarded warm-up frames.
+const uint32_t CAMERA_WARMUP_DELAY_MS = 250;
 
 // --------------------------- RUN ID ------------------------------------------
 
@@ -91,7 +101,7 @@ const char* RUN_ID = "TIMELAPSE_01";
 //   FRAMESIZE_XGA   = 1024x768
 //   FRAMESIZE_SXGA  = 1280x1024
 //   FRAMESIZE_UXGA  = 1600x1200
-const framesize_t PHOTO_FRAME_SIZE = FRAMESIZE_SVGA;
+const framesize_t PHOTO_FRAME_SIZE = FRAMESIZE_UXGA;
 
 // JPEG quality:
 //   10 = high quality / larger file
@@ -100,7 +110,7 @@ const framesize_t PHOTO_FRAME_SIZE = FRAMESIZE_SVGA;
 //   20+ = lower quality / smaller file
 //
 // Valid JPEG quality values are generally 10-63.
-const int PHOTO_JPEG_QUALITY = 12;
+const int PHOTO_JPEG_QUALITY = 10;
 
 // Use onboard flash LED?
 // false is recommended for a battery-powered outdoor timelapse.
@@ -166,6 +176,10 @@ const bool STOP_ON_IMAGE_ERROR = false;
 //   1441 images gives approximately 72 hours from first to last image.
 const uint32_t MAX_IMAGES = 0;
 
+// Maximum number of failure records that can be kept in RTC memory while
+// the SD card is unavailable. Oldest records are dropped if this fills.
+const uint8_t MAX_PENDING_FAILURES = 16;
+
 // --------------------------- SAFETY ------------------------------------------
 //
 // Never format the SD card automatically.
@@ -204,6 +218,73 @@ const char* SUMMARY_FILE = "/SUMMARY.TXT";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+
+// ============================================================================
+// FAILURE DIAGNOSTICS
+// ============================================================================
+
+enum FailureStage : uint8_t {
+  FAILURE_NONE = 0,
+  FAILURE_BOOT_RESET,
+  FAILURE_CAMERA_INIT,
+  FAILURE_CAMERA_WARMUP,
+  FAILURE_CAMERA_CAPTURE,
+  FAILURE_JPEG_BUFFER,
+  FAILURE_SD_INIT,
+  FAILURE_SD_CARD,
+  FAILURE_FILE_OPEN,
+  FAILURE_FILE_WRITE,
+  FAILURE_CSV_WRITE
+};
+
+const char* failureStageName(FailureStage stage) {
+  switch (stage) {
+    case FAILURE_BOOT_RESET:     return "BOOT_RESET";
+    case FAILURE_CAMERA_INIT:    return "CAMERA_INIT";
+    case FAILURE_CAMERA_WARMUP:  return "CAMERA_WARMUP";
+    case FAILURE_CAMERA_CAPTURE: return "CAMERA_CAPTURE";
+    case FAILURE_JPEG_BUFFER:    return "JPEG_BUFFER";
+    case FAILURE_SD_INIT:        return "SD_INIT";
+    case FAILURE_SD_CARD:        return "SD_CARD";
+    case FAILURE_FILE_OPEN:      return "FILE_OPEN";
+    case FAILURE_FILE_WRITE:     return "FILE_WRITE";
+    case FAILURE_CSV_WRITE:      return "CSV_WRITE";
+    default:                     return "NONE";
+  }
+}
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN:   return "UNKNOWN";
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXTERNAL";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "OTHER";
+  }
+}
+
+struct PendingFailure {
+  uint64_t bootCount;
+  uint32_t attemptNumber;
+  uint32_t successfulImagesAtFailure;
+  int wakeCause;
+  int resetReason;
+  uint8_t stage;
+  int32_t errorCode;
+  uint8_t warmupFramesCompleted;
+  uint32_t captureTimeMs;
+  uint32_t imageBytes;
+  char detail[96];
+};
+
+
 // ============================================================================
 // RTC MEMORY
 // ============================================================================
@@ -216,6 +297,10 @@ RTC_DATA_ATTR uint32_t rtcImageCount = 0;
 RTC_DATA_ATTR uint32_t rtcFailedImages = 0;
 RTC_DATA_ATTR uint64_t rtcBootCount = 0;
 
+RTC_DATA_ATTR PendingFailure rtcPendingFailures[MAX_PENDING_FAILURES];
+RTC_DATA_ATTR uint8_t rtcPendingFailureCount = 0;
+RTC_DATA_ATTR uint32_t rtcPendingFailureOverflow = 0;
+
 // ============================================================================
 // RUNTIME STATE
 // ============================================================================
@@ -225,10 +310,17 @@ uint32_t currentImageBytes = 0;
 uint32_t currentCaptureTimeMs = 0;
 uint64_t currentElapsedFromFirstSec = 0;
 
+uint8_t currentWarmupFramesCompleted = 0;
+
+int currentWakeCause = 0;
+esp_reset_reason_t currentResetReason = ESP_RST_UNKNOWN;
+
 // JPEG copied from the camera framebuffer into PSRAM/heap.
 // This lets us deinitialize the camera before using SPI SD.
 uint8_t* photoBuffer = nullptr;
 size_t photoBufferSize = 0;
+
+void freePhotoBuffer();
 
 // ============================================================================
 // SERIAL
@@ -293,9 +385,108 @@ void initialiseRtcState() {
     rtcImageCount = 0;
     rtcFailedImages = 0;
     rtcBootCount = 0;
+    rtcPendingFailureCount = 0;
+    rtcPendingFailureOverflow = 0;
+
+    memset(
+        rtcPendingFailures,
+        0,
+        sizeof(rtcPendingFailures)
+    );
   }
 
   rtcBootCount++;
+}
+
+
+// ============================================================================
+// FAILURE RECORDING
+// ============================================================================
+
+void printFailureDetails(
+    FailureStage stage,
+    int32_t errorCode,
+    const char* detail
+) {
+  logSerial(
+      "FAILURE [" +
+      String(failureStageName(stage)) +
+      "]"
+  );
+
+  logSerial(
+      "  Error code: " +
+      String(errorCode)
+  );
+
+  logSerial(
+      "  Detail: " +
+      String(detail)
+  );
+
+  logSerial(
+      "  Warm-up frames completed: " +
+      String(currentWarmupFramesCompleted)
+  );
+
+  logSerial(
+      "  Reset reason: " +
+      String(resetReasonName(currentResetReason))
+  );
+}
+
+void recordFailure(
+    FailureStage stage,
+    int32_t errorCode,
+    const char* detail
+) {
+  rtcFailedImages++;
+
+  printFailureDetails(
+      stage,
+      errorCode,
+      detail
+  );
+
+  if (rtcPendingFailureCount >= MAX_PENDING_FAILURES) {
+    // Keep the newest records and remember that older records were dropped.
+    for (uint8_t i = 1; i < rtcPendingFailureCount; ++i) {
+      rtcPendingFailures[i - 1] = rtcPendingFailures[i];
+    }
+
+    rtcPendingFailureCount =
+        MAX_PENDING_FAILURES - 1;
+
+    rtcPendingFailureOverflow++;
+  }
+
+  PendingFailure& failure =
+      rtcPendingFailures[rtcPendingFailureCount];
+
+  memset(
+      &failure,
+      0,
+      sizeof(PendingFailure)
+  );
+
+  failure.bootCount = rtcBootCount;
+  failure.attemptNumber = (uint32_t)rtcBootCount;
+  failure.successfulImagesAtFailure = rtcImageCount;
+  failure.wakeCause = currentWakeCause;
+  failure.resetReason = (int)currentResetReason;
+  failure.stage = (uint8_t)stage;
+  failure.errorCode = errorCode;
+  failure.warmupFramesCompleted = currentWarmupFramesCompleted;
+  failure.captureTimeMs = currentCaptureTimeMs;
+  failure.imageBytes = currentImageBytes;
+
+  strncpy(
+      failure.detail,
+      detail,
+      sizeof(failure.detail) - 1
+  );
+
+  rtcPendingFailureCount++;
 }
 
 // ============================================================================
@@ -338,7 +529,6 @@ bool initialiseCamera() {
     config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
     config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
-    // Fallback for boards without PSRAM.
     config.frame_size = FRAMESIZE_VGA;
     config.jpeg_quality = 15;
     config.fb_count = 1;
@@ -347,34 +537,72 @@ bool initialiseCamera() {
   }
 
   logSerial("Initializing camera...");
-  logSerial(String("PSRAM: ") + (psramFound() ? "YES" : "NO"));
+  logSerial(
+      String("PSRAM: ") +
+      (psramFound() ? "YES" : "NO")
+  );
 
   esp_err_t err = esp_camera_init(&config);
 
   if (err != ESP_OK) {
-    logSerial(
-        "ERROR: Camera initialization failed: 0x" +
-        String((uint32_t)err, HEX)
+    char detail[96];
+
+    snprintf(
+        detail,
+        sizeof(detail),
+        "esp_camera_init() returned 0x%08lX",
+        (unsigned long)err
     );
+
+    recordFailure(
+        FAILURE_CAMERA_INIT,
+        (int32_t)err,
+        detail
+    );
+
     return false;
   }
 
-  sensor_t* sensor = esp_camera_sensor_get();
+  sensor_t* sensor =
+      esp_camera_sensor_get();
 
   if (sensor != nullptr) {
     if (psramFound()) {
-      sensor->set_framesize(sensor, PHOTO_FRAME_SIZE);
-      sensor->set_quality(sensor, PHOTO_JPEG_QUALITY);
+      sensor->set_framesize(
+          sensor,
+          PHOTO_FRAME_SIZE
+      );
+
+      sensor->set_quality(
+          sensor,
+          PHOTO_JPEG_QUALITY
+      );
     } else {
-      sensor->set_framesize(sensor, FRAMESIZE_VGA);
-      sensor->set_quality(sensor, 15);
+      sensor->set_framesize(
+          sensor,
+          FRAMESIZE_VGA
+      );
+
+      sensor->set_quality(
+          sensor,
+          15
+      );
     }
   }
 
-  pinMode(FLASH_LED_PIN, OUTPUT);
-  digitalWrite(FLASH_LED_PIN, LOW);
+  pinMode(
+      FLASH_LED_PIN,
+      OUTPUT
+  );
 
-  logSerial("Camera initialized successfully.");
+  digitalWrite(
+      FLASH_LED_PIN,
+      LOW
+  );
+
+  logSerial(
+      "Camera initialized successfully."
+  );
 
   return true;
 }
@@ -384,40 +612,56 @@ bool initialiseCamera() {
 // ============================================================================
 
 bool initialiseSD_MMC() {
-  delay(SD_STARTUP_DELAY_MS);
+  delay(
+      SD_STARTUP_DELAY_MS
+  );
 
-  logSerial("Initializing SD_MMC...");
   logSerial(
-      String("SD_MMC bus mode: ") +
-      (SD_MMC_USE_1BIT_MODE ? "1-bit" : "4-bit")
+      "Initializing SD_MMC..."
   );
 
-  bool mounted = SD_MMC.begin(
-      "/sdcard",
-      SD_MMC_USE_1BIT_MODE,
-      FORMAT_SD_IF_MOUNT_FAILS
-  );
+  bool mounted =
+      SD_MMC.begin(
+          "/sdcard",
+          SD_MMC_USE_1BIT_MODE,
+          FORMAT_SD_IF_MOUNT_FAILS
+      );
 
   if (!mounted) {
-    logSerial("ERROR: SD_MMC mount failed.");
+    recordFailure(
+        FAILURE_SD_INIT,
+        -1,
+        "SD_MMC.begin() returned false"
+    );
+
     return false;
   }
 
-  uint8_t cardType = SD_MMC.cardType();
+  uint8_t cardType =
+      SD_MMC.cardType();
 
   if (cardType == CARD_NONE) {
-    logSerial("ERROR: No SD card detected.");
+    recordFailure(
+        FAILURE_SD_CARD,
+        -1,
+        "SD_MMC mounted but returned CARD_NONE"
+    );
 
     SD_MMC.end();
+
     return false;
   }
 
   uint64_t cardSizeMB =
-      SD_MMC.cardSize() / (1024ULL * 1024ULL);
+      SD_MMC.cardSize() /
+      (1024ULL * 1024ULL);
 
   logSerial(
       "SD_MMC card detected: " +
-      String((unsigned long long)cardSizeMB) +
+      String(
+          (unsigned long long)
+          cardSizeMB
+      ) +
       " MiB"
   );
 
@@ -429,22 +673,27 @@ bool initialiseSD_MMC() {
 // ============================================================================
 
 bool initialiseSD_SPI() {
-  delay(SD_STARTUP_DELAY_MS);
+  delay(
+      SD_STARTUP_DELAY_MS
+  );
 
-  logSerial("Initializing SPI SD...");
+  logSerial(
+      "Initializing SPI SD..."
+  );
+
   logSerial(
       "SPI frequency: " +
-      String(SD_SPI_FREQUENCY_HZ) +
+      String(
+          SD_SPI_FREQUENCY_HZ
+      ) +
       " Hz"
   );
 
-  // Make sure no previous SD/SPI session is active.
   SD.end();
   SPI.end();
 
   delay(100);
 
-  // ESP32-CAM onboard SD socket.
   SPI.begin(
       SD_SPI_SCK_PIN,
       SD_SPI_MISO_PIN,
@@ -454,39 +703,55 @@ bool initialiseSD_SPI() {
 
   delay(100);
 
-  bool mounted = SD.begin(
-      SD_SPI_CS_PIN,
-      SPI,
-      SD_SPI_FREQUENCY_HZ,
-      "/sdcard",
-      5,
-      false
-  );
+  bool mounted =
+      SD.begin(
+          SD_SPI_CS_PIN,
+          SPI,
+          SD_SPI_FREQUENCY_HZ,
+          "/sdcard",
+          5,
+          false
+      );
 
   if (!mounted) {
-    logSerial("ERROR: SPI SD mount failed.");
+    recordFailure(
+        FAILURE_SD_INIT,
+        -1,
+        "SD.begin() returned false"
+    );
 
     SD.end();
     SPI.end();
+
     return false;
   }
 
-  uint8_t cardType = SD.cardType();
+  uint8_t cardType =
+      SD.cardType();
 
   if (cardType == CARD_NONE) {
-    logSerial("ERROR: No SD card detected.");
+    recordFailure(
+        FAILURE_SD_CARD,
+        -1,
+        "SD mounted but returned CARD_NONE"
+    );
 
     SD.end();
     SPI.end();
+
     return false;
   }
 
   uint64_t cardSizeMB =
-      SD.cardSize() / (1024ULL * 1024ULL);
+      SD.cardSize() /
+      (1024ULL * 1024ULL);
 
   logSerial(
       "SPI SD card detected: " +
-      String((unsigned long long)cardSizeMB) +
+      String(
+          (unsigned long long)
+          cardSizeMB
+      ) +
       " MiB"
   );
 
@@ -555,23 +820,39 @@ void ensureCsvHeader() {
     return;
   }
 
-  File file = sdOpen(LOG_FILE, FILE_WRITE);
+  File file =
+      sdOpen(
+          LOG_FILE,
+          FILE_WRITE
+      );
 
   if (!file) {
-    logSerial("WARNING: Could not create CSV log.");
+    logSerial(
+        "WARNING: Could not create CSV log."
+    );
     return;
   }
 
   file.println(
+      "record_type,"
       "run_id,"
+      "attempt_number,"
       "image_number,"
       "filename,"
+      "status,"
+      "failure_stage,"
+      "error_code,"
+      "failure_detail,"
+      "wake_cause,"
+      "reset_reason,"
+      "warmup_frames_completed,"
+      "capture_time_ms,"
+      "image_bytes,"
       "elapsed_from_first_s,"
       "planned_interval_s,"
-      "image_bytes,"
-      "capture_time_ms,"
       "boot_count,"
-      "failed_images"
+      "failed_images,"
+      "pending_failure_overflow"
   );
 
   file.close();
@@ -618,6 +899,213 @@ void writeCsvLog(const String& filename) {
   file.close();
 }
 
+
+// ============================================================================
+// FAILURE CSV RECORDS
+// ============================================================================
+
+bool appendFailureToCsv(uint8_t failureIndex) {
+  const PendingFailure& failure = rtcPendingFailures[failureIndex];
+  if (!ENABLE_CSV_LOG) {
+    return true;
+  }
+
+  File file =
+      sdOpen(
+          LOG_FILE,
+          FILE_APPEND
+      );
+
+  if (!file) {
+    return false;
+  }
+
+  // image_number is the next image that would have been saved.
+  uint32_t intendedImageNumber =
+      failure.successfulImagesAtFailure + 1;
+
+  file.print("FAILURE");
+  file.print(",");
+  file.print(RUN_ID);
+  file.print(",");
+  file.print(failure.attemptNumber);
+  file.print(",");
+  file.print(intendedImageNumber);
+  file.print(",");
+  file.print("");
+  file.print(",");
+  file.print("FAILED");
+  file.print(",");
+  file.print(
+      failureStageName(
+          (FailureStage)failure.stage
+      )
+  );
+  file.print(",");
+  file.print(failure.errorCode);
+  file.print(",");
+  file.print(failure.detail);
+  file.print(",");
+  file.print(failure.wakeCause);
+  file.print(",");
+  file.print(
+      resetReasonName(
+          (esp_reset_reason_t)failure.resetReason
+      )
+  );
+  file.print(",");
+  file.print(failure.warmupFramesCompleted);
+  file.print(",");
+  file.print(failure.captureTimeMs);
+  file.print(",");
+  file.print(failure.imageBytes);
+  file.print(",");
+  file.print("");
+  file.print(",");
+  file.print(SLEEP_INTERVAL_SECONDS);
+  file.print(",");
+  file.print(
+      (unsigned long long)
+      failure.bootCount
+  );
+  file.print(",");
+  file.print(
+      (unsigned long long)
+      rtcFailedImages
+  );
+  file.print(",");
+  file.println(
+      (unsigned long long)
+      rtcPendingFailureOverflow
+  );
+
+  file.flush();
+  file.close();
+
+  return true;
+}
+
+void flushPendingFailuresToCsv() {
+  if (!ENABLE_CSV_LOG ||
+      rtcPendingFailureCount == 0) {
+    return;
+  }
+
+  logSerial(
+      "Flushing " +
+      String(rtcPendingFailureCount) +
+      " pending failure record(s) to CSV..."
+  );
+
+  while (rtcPendingFailureCount > 0) {
+    if (!appendFailureToCsv(0)) {
+      logSerial(
+          "WARNING: Could not write pending failure record."
+      );
+      return;
+    }
+
+    for (
+        uint8_t i = 1;
+        i < rtcPendingFailureCount;
+        ++i
+    ) {
+      rtcPendingFailures[i - 1] =
+          rtcPendingFailures[i];
+    }
+
+    rtcPendingFailureCount--;
+  }
+
+  logSerial(
+      "Pending failure records written successfully."
+  );
+}
+
+// ============================================================================
+// SUCCESS CSV RECORDS
+// ============================================================================
+
+bool appendSuccessToCsv(
+    const String& filename
+) {
+  if (!ENABLE_CSV_LOG) {
+    return true;
+  }
+
+  File file =
+      sdOpen(
+          LOG_FILE,
+          FILE_APPEND
+      );
+
+  if (!file) {
+    return false;
+  }
+
+  file.print("SUCCESS");
+  file.print(",");
+  file.print(RUN_ID);
+  file.print(",");
+  file.print(
+      (unsigned long long)
+      rtcBootCount
+  );
+  file.print(",");
+  file.print(currentImageNumber);
+  file.print(",");
+  file.print(filename);
+  file.print(",");
+  file.print("SAVED");
+  file.print(",");
+  file.print("");
+  file.print(",");
+  file.print("");
+  file.print(",");
+  file.print("");
+  file.print(",");
+  file.print(currentWakeCause);
+  file.print(",");
+  file.print(
+      resetReasonName(
+          currentResetReason
+      )
+  );
+  file.print(",");
+  file.print(currentWarmupFramesCompleted);
+  file.print(",");
+  file.print(currentCaptureTimeMs);
+  file.print(",");
+  file.print(currentImageBytes);
+  file.print(",");
+  file.print(
+      (unsigned long long)
+      currentElapsedFromFirstSec
+  );
+  file.print(",");
+  file.print(SLEEP_INTERVAL_SECONDS);
+  file.print(",");
+  file.print(
+      (unsigned long long)
+      rtcBootCount
+  );
+  file.print(",");
+  file.print(
+      (unsigned long long)
+      rtcFailedImages
+  );
+  file.print(",");
+  file.println(
+      (unsigned long long)
+      rtcPendingFailureOverflow
+  );
+
+  file.flush();
+  file.close();
+
+  return true;
+}
+
 // ============================================================================
 // SUMMARY
 // ============================================================================
@@ -661,8 +1149,14 @@ void updateSummary() {
   file.print("Images saved: ");
   file.println((unsigned long)rtcImageCount);
 
-  file.print("Failed image attempts: ");
+  file.print("Failed image/cycle attempts: ");
   file.println((unsigned long)rtcFailedImages);
+
+  file.print("Pending failure records: ");
+  file.println(rtcPendingFailureCount);
+
+  file.print("Pending failure overflow: ");
+  file.println((unsigned long)rtcPendingFailureOverflow);
 
   file.print("Sleep interval: ");
   file.print(SLEEP_INTERVAL_SECONDS);
@@ -730,61 +1224,127 @@ void updateSummary() {
 // ============================================================================
 
 bool capturePhotoToBuffer() {
+  currentWarmupFramesCompleted = 0;
+
   if (USE_FLASH) {
-    digitalWrite(FLASH_LED_PIN, HIGH);
+    digitalWrite(
+        FLASH_LED_PIN,
+        HIGH
+    );
+
     delay(100);
   }
 
-  uint32_t captureStart = millis();
+  // Discard warm-up frames so exposure and white balance can settle.
+  for (
+      uint8_t i = 0;
+      i < CAMERA_WARMUP_FRAMES;
+      ++i
+  ) {
+    camera_fb_t* warmup =
+        esp_camera_fb_get();
 
-  camera_fb_t* fb = esp_camera_fb_get();
+    if (warmup == nullptr) {
+      if (USE_FLASH) {
+        digitalWrite(
+            FLASH_LED_PIN,
+            LOW
+        );
+      }
+
+      recordFailure(
+          FAILURE_CAMERA_WARMUP,
+          -1,
+          "esp_camera_fb_get() returned nullptr during warm-up"
+      );
+
+      return false;
+    }
+
+    esp_camera_fb_return(
+        warmup
+    );
+
+    currentWarmupFramesCompleted++;
+
+    if (CAMERA_WARMUP_DELAY_MS > 0) {
+      delay(
+          CAMERA_WARMUP_DELAY_MS
+      );
+    }
+  }
+
+  // Capture the frame that will actually be saved.
+  uint32_t captureStart =
+      millis();
+
+  camera_fb_t* fb =
+      esp_camera_fb_get();
 
   currentCaptureTimeMs =
       millis() - captureStart;
 
   if (USE_FLASH) {
-    digitalWrite(FLASH_LED_PIN, LOW);
+    digitalWrite(
+        FLASH_LED_PIN,
+        LOW
+    );
   }
 
   if (fb == nullptr) {
-    rtcFailedImages++;
-    logSerial("ERROR: Camera capture failed.");
+    recordFailure(
+        FAILURE_CAMERA_CAPTURE,
+        -1,
+        "esp_camera_fb_get() returned nullptr for saved frame"
+    );
+
     return false;
   }
 
-  currentImageNumber = rtcImageCount + 1;
-  currentImageBytes = fb->len;
+  currentImageNumber =
+      rtcImageCount + 1;
+
+  currentImageBytes =
+      fb->len;
 
   currentElapsedFromFirstSec =
-      (uint64_t)(currentImageNumber - 1) *
+      (uint64_t)(
+          currentImageNumber - 1
+      ) *
       SLEEP_INTERVAL_SECONDS;
 
-  // Release any previous buffer.
   if (photoBuffer != nullptr) {
     free(photoBuffer);
     photoBuffer = nullptr;
     photoBufferSize = 0;
   }
 
-  photoBufferSize = fb->len;
+  photoBufferSize =
+      fb->len;
 
-  // Prefer PSRAM for the JPEG copy.
+  // Prefer PSRAM.
   photoBuffer =
-      (uint8_t*)ps_malloc(photoBufferSize);
+      (uint8_t*)ps_malloc(
+          photoBufferSize
+      );
 
-  // Fallback to normal heap if PSRAM allocation failed.
+  // Fall back to normal heap.
   if (photoBuffer == nullptr) {
     photoBuffer =
-        (uint8_t*)malloc(photoBufferSize);
+        (uint8_t*)malloc(
+            photoBufferSize
+        );
   }
 
   if (photoBuffer == nullptr) {
-    rtcFailedImages++;
+    esp_camera_fb_return(
+        fb
+    );
 
-    esp_camera_fb_return(fb);
-
-    logSerial(
-        "ERROR: Could not allocate JPEG buffer."
+    recordFailure(
+        FAILURE_JPEG_BUFFER,
+        -1,
+        "Could not allocate memory for JPEG copy"
     );
 
     return false;
@@ -796,7 +1356,9 @@ bool capturePhotoToBuffer() {
       photoBufferSize
   );
 
-  esp_camera_fb_return(fb);
+  esp_camera_fb_return(
+      fb
+  );
 
   return true;
 }
@@ -806,15 +1368,15 @@ bool capturePhotoToBuffer() {
 // ============================================================================
 
 bool savePhotoBuffer() {
-  if (photoBuffer == nullptr ||
-      photoBufferSize == 0) {
-
-    rtcFailedImages++;
-
-    logSerial(
-        "ERROR: JPEG buffer is empty."
+  if (
+      photoBuffer == nullptr ||
+      photoBufferSize == 0
+  ) {
+    recordFailure(
+        FAILURE_JPEG_BUFFER,
+        -1,
+        "JPEG buffer is empty when save was attempted"
     );
-
     return false;
   }
 
@@ -824,23 +1386,26 @@ bool savePhotoBuffer() {
       filenameBuffer,
       sizeof(filenameBuffer),
       "/IMG_%06lu.jpg",
-      (unsigned long)currentImageNumber
+      (unsigned long)
+      currentImageNumber
   );
 
-  String filename(filenameBuffer);
+  String filename(
+      filenameBuffer
+  );
 
   File file =
-      sdOpen(filename.c_str(), FILE_WRITE);
+      sdOpen(
+          filename.c_str(),
+          FILE_WRITE
+      );
 
   if (!file) {
-    rtcFailedImages++;
-
-    logSerial(
-        "ERROR: Could not open " +
-        filename +
-        " for writing."
+    recordFailure(
+        FAILURE_FILE_OPEN,
+        -1,
+        "Could not open JPEG file for writing"
     );
-
     return false;
   }
 
@@ -854,12 +1419,20 @@ bool savePhotoBuffer() {
   file.close();
 
   if (written != photoBufferSize) {
-    rtcFailedImages++;
+    char detail[96];
 
-    logSerial(
-        "ERROR: Incomplete write for " +
-        filename +
-        "."
+    snprintf(
+        detail,
+        sizeof(detail),
+        "Incomplete JPEG write: %u of %u bytes",
+        (unsigned int)written,
+        (unsigned int)photoBufferSize
+    );
+
+    recordFailure(
+        FAILURE_FILE_WRITE,
+        (int32_t)written,
+        detail
     );
 
     return false;
@@ -867,20 +1440,37 @@ bool savePhotoBuffer() {
 
   rtcImageCount++;
 
-  writeCsvLog(filename);
+  if (!appendSuccessToCsv(filename)) {
+    // The image itself is already safe on the SD card.
+    // Keep a failure record so the CSV can be diagnosed later.
+    recordFailure(
+        FAILURE_CSV_WRITE,
+        -1,
+        "Image was saved, but the success row could not be appended to CSV"
+    );
+  }
+
   updateSummary();
 
   logSerial(
       "Saved " +
       filename +
       " | " +
-      String((unsigned long)currentImageBytes) +
+      String(
+          (unsigned long)
+          currentImageBytes
+      ) +
       " bytes" +
       " | capture " +
-      String(currentCaptureTimeMs) +
+      String(
+          currentCaptureTimeMs
+      ) +
       " ms" +
       " | image " +
-      String((unsigned long)rtcImageCount)
+      String(
+          (unsigned long)
+          rtcImageCount
+      )
   );
 
   return true;
@@ -942,41 +1532,90 @@ void setup() {
     }
   }
 
+  currentWakeCause =
+      (int)esp_sleep_get_wakeup_cause();
+
+  currentResetReason =
+      esp_reset_reason();
+
   initialiseRtcState();
 
-  esp_sleep_wakeup_cause_t wakeCause =
-      esp_sleep_get_wakeup_cause();
-
-  logSerial("Run ID: " + String(RUN_ID));
+  logSerial(
+      "Run ID: " +
+      String(RUN_ID)
+  );
 
   logSerial(
       "Wake cause: " +
-      String((int)wakeCause)
+      String(currentWakeCause)
+  );
+
+  logSerial(
+      "Reset reason: " +
+      String(
+          resetReasonName(
+              currentResetReason
+          )
+      )
   );
 
   logSerial(
       "Images already saved: " +
-      String((unsigned long)rtcImageCount)
+      String(
+          (unsigned long)
+          rtcImageCount
+      )
   );
 
   logSerial(
-      "SD interface: " +
-      String(USE_SPI_SD ? "SPI" : "SD_MMC")
+      "Failed image/cycle attempts: " +
+      String(
+          (unsigned long)
+          rtcFailedImages
+      )
   );
 
-  // ---------------------------------------------------------
-  // Hardware startup delay
-  // ---------------------------------------------------------
+  // Detect unexpected resets after the first boot.
+  //
+  // A normal timer wake should report DEEPSLEEP. A BROWNOUT, WDT, PANIC,
+  // POWERON, etc. can indicate a power or stability problem and is logged
+  // as a failure record.
+  if (
+      rtcBootCount > 1 &&
+      currentResetReason != ESP_RST_DEEPSLEEP
+  ) {
+    char detail[96];
+
+    snprintf(
+        detail,
+        sizeof(detail),
+        "Unexpected reset reason: %s",
+        resetReasonName(
+            currentResetReason
+        )
+    );
+
+    recordFailure(
+        FAILURE_BOOT_RESET,
+        (int32_t)currentResetReason,
+        detail
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Startup stabilization
+  // --------------------------------------------------------------------------
 
   delay(CAMERA_SETTLE_MS);
 
-  // ---------------------------------------------------------
-  // Stop permanently when MAX_IMAGES is reached.
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
+  // Maximum image count
+  // --------------------------------------------------------------------------
 
-  if (MAX_IMAGES > 0 &&
-      rtcImageCount >= MAX_IMAGES) {
-
+  if (
+      MAX_IMAGES > 0 &&
+      rtcImageCount >= MAX_IMAGES
+  ) {
     logSerial(
         "Maximum image count reached. Stopping."
     );
@@ -988,14 +1627,12 @@ void setup() {
     esp_deep_sleep_start();
   }
 
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
   // CAMERA
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
 
   if (!initialiseCamera()) {
-    rtcFailedImages++;
-
-    logSerial("Camera initialization failed.");
+    esp_camera_deinit();
 
     if (STOP_ON_IMAGE_ERROR) {
       while (true) {
@@ -1006,15 +1643,14 @@ void setup() {
     goToDeepSleep();
   }
 
-  bool captureOk = capturePhotoToBuffer();
+  bool captureOk =
+      capturePhotoToBuffer();
 
   // Camera is no longer required after the JPEG has been copied.
   esp_camera_deinit();
 
   if (!captureOk) {
     if (STOP_ON_IMAGE_ERROR) {
-      logSerial("Stopping because photo capture failed.");
-
       while (true) {
         delay(1000);
       }
@@ -1023,19 +1659,13 @@ void setup() {
     goToDeepSleep();
   }
 
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
   // SD CARD
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
 
   if (!initialiseSD()) {
-    logSerial("SD initialization failed.");
-
     if (STOP_ON_IMAGE_ERROR) {
-      if (photoBuffer != nullptr) {
-        free(photoBuffer);
-        photoBuffer = nullptr;
-        photoBufferSize = 0;
-      }
+      freePhotoBuffer();
 
       while (true) {
         delay(1000);
@@ -1045,29 +1675,22 @@ void setup() {
     goToDeepSleep();
   }
 
-  // ---------------------------------------------------------
-  // LOGGING
-  // ---------------------------------------------------------
-
+  // SD is available now. Create the CSV and flush failures from earlier
+  // cycles before writing the current success row.
   ensureCsvHeader();
+  flushPendingFailuresToCsv();
 
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
   // SAVE PHOTO
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
 
-  bool saveOk = savePhotoBuffer();
+  bool saveOk =
+      savePhotoBuffer();
 
   if (!saveOk) {
-    logSerial("ERROR: Could not save the JPEG.");
-
     if (STOP_ON_IMAGE_ERROR) {
       closeSD();
-
-      if (photoBuffer != nullptr) {
-        free(photoBuffer);
-        photoBuffer = nullptr;
-        photoBufferSize = 0;
-      }
+      freePhotoBuffer();
 
       while (true) {
         delay(1000);
@@ -1075,9 +1698,9 @@ void setup() {
     }
   }
 
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
   // SLEEP
-  // ---------------------------------------------------------
+  // --------------------------------------------------------------------------
 
   goToDeepSleep();
 }

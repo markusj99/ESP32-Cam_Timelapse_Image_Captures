@@ -25,6 +25,11 @@ from PIL import Image
 # USER SETTINGS
 # =============================================================================
 
+# Rotate every photo 180 degrees (upside down).
+# True  = photos are rotated upside down.
+# False = photos are left unchanged.
+FLIP_PHOTO_UPSIDE_DOWN = True
+
 # Frames per second in the final MP4.
 FPS = 10
 
@@ -90,8 +95,9 @@ def image_sort_key(path: Path):
 
 def find_images(folder: Path) -> list[Path]:
     images = [
-        p for p in folder.iterdir()
-        if p.is_file() and p.suffix in IMAGE_EXTENSIONS
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix in IMAGE_EXTENSIONS
     ]
 
     images.sort(key=image_sort_key)
@@ -104,12 +110,21 @@ def find_images(folder: Path) -> list[Path]:
 
 def load_rgb(path: Path) -> np.ndarray:
     with Image.open(path) as image:
-        return np.asarray(image.convert("RGB"))
+        image = image.convert("RGB")
+
+        if FLIP_PHOTO_UPSIDE_DOWN:
+            image = image.transpose(Image.Transpose.ROTATE_180)
+
+        return np.asarray(image)
 
 
 def prepare_frame(path: Path, width: int, height: int) -> np.ndarray:
     with Image.open(path) as image:
         image = image.convert("RGB")
+
+        # Rotate the image 180 degrees if enabled.
+        if FLIP_PHOTO_UPSIDE_DOWN:
+            image = image.transpose(Image.Transpose.ROTATE_180)
 
         if image.size != (width, height):
             if not RESIZE_MISMATCHED_IMAGES:
@@ -157,6 +172,7 @@ def create_video(images: list[Path], output_path: Path) -> None:
     print(f"FPS:         {FPS}")
     print(f"Resolution:  {width} x {height}")
     print(f"Duration:    {duration:.2f} s")
+    print(f"Upside down: {FLIP_PHOTO_UPSIDE_DOWN}")
     print(f"Output:      {output_path}")
     print()
 
@@ -175,6 +191,7 @@ def create_video(images: list[Path], output_path: Path) -> None:
 
             if i == 1 or i == len(images) or i % PROGRESS_EVERY == 0:
                 percent = i / len(images) * 100
+
                 print(
                     f"\rEncoding: {i}/{len(images)} "
                     f"({percent:6.2f}%)",
@@ -183,6 +200,7 @@ def create_video(images: list[Path], output_path: Path) -> None:
                 )
 
         print()
+
     finally:
         writer.close()
 
@@ -247,6 +265,7 @@ def main() -> None:
 
     try:
         create_video(images, output_path)
+
     except Exception as exc:
         print()
         print("Video creation failed:")
@@ -254,10 +273,12 @@ def main() -> None:
 
         root = tk.Tk()
         root.withdraw()
+
         messagebox.showerror(
             "Video creation failed",
             str(exc),
         )
+
         root.destroy()
         raise
 
